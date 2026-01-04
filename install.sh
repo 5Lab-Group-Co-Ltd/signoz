@@ -7,6 +7,15 @@
 # - Auto-detects OS/Arch (AMD64/ARM64)
 # - Creates Systemd Service automatically
 # - Configures MySQL/PHP monitoring
+#
+# Environment Variables (for non-interactive mode):
+#   SIGNOZ_ENDPOINT     - Required. SigNoz endpoint (e.g., signoz.5lab.co:443)
+#   ENABLE_MYSQL        - Optional. "y" to enable MySQL monitoring
+#   MYSQL_USER          - MySQL username (required if ENABLE_MYSQL=y)
+#   MYSQL_PASS          - MySQL password (required if ENABLE_MYSQL=y)
+#   MYSQL_HOST          - MySQL host (default: 127.0.0.1:3306)
+#   ENABLE_PHPFPM       - Optional. "y" to enable PHP-FPM monitoring
+#   ENABLE_PHP_OTEL     - Optional. "y" to install OpenTelemetry PHP extensions
 # ==============================================================================
 
 set -e
@@ -22,6 +31,43 @@ log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_err()  { echo -e "${RED}[ERROR]${NC} $1"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 
+# --- Detect Interactive Mode ---
+INTERACTIVE=false
+if [[ -t 0 ]]; then
+    INTERACTIVE=true
+fi
+
+prompt_user() {
+    local prompt="$1"
+    local var_name="$2"
+    local default="$3"
+    
+    if [[ "$INTERACTIVE" == "true" ]]; then
+        read -p "$prompt" user_input
+        eval "$var_name=\"\${user_input:-$default}\""
+    else
+        eval "$var_name=\"$default\""
+    fi
+}
+
+prompt_yes_no() {
+    local prompt="$1"
+    local env_var="$2"
+    
+    # Check if env var is already set
+    local current_val="${!env_var}"
+    if [[ -n "$current_val" ]]; then
+        [[ "$current_val" =~ ^[Yy]$ ]] && return 0 || return 1
+    fi
+    
+    if [[ "$INTERACTIVE" == "true" ]]; then
+        read -p "$prompt" user_input
+        [[ "$user_input" =~ ^[Yy]$ ]] && return 0 || return 1
+    else
+        return 1  # Default to no in non-interactive mode
+    fi
+}
+
 # --- 1. Root Check ---
 if [[ $EUID -ne 0 ]]; then
    log_err "This script must be run as root (sudo)." 
@@ -32,10 +78,16 @@ fi
 log_info "Phase 1: Connectivity Checks"
 
 if [ -z "$SIGNOZ_ENDPOINT" ]; then
-    echo "Please enter your SigNoz Endpoint (e.g., signoz.5lab.co:443):"
-    read -r USER_ENDPOINT
-    [ -z "$USER_ENDPOINT" ] && { log_err "Endpoint cannot be empty."; exit 1; }
-    SIGNOZ_ENDPOINT="$USER_ENDPOINT"
+    if [[ "$INTERACTIVE" == "true" ]]; then
+        echo "Please enter your SigNoz Endpoint (e.g., signoz.5lab.co:443):"
+        read -r USER_ENDPOINT
+        [ -z "$USER_ENDPOINT" ] && { log_err "Endpoint cannot be empty."; exit 1; }
+        SIGNOZ_ENDPOINT="$USER_ENDPOINT"
+    else
+        log_err "SIGNOZ_ENDPOINT environment variable is required in non-interactive mode."
+        echo "Usage: SIGNOZ_ENDPOINT=\"host:port\" bash install.sh"
+        exit 1
+    fi
 fi
 
 HOST=$(echo $SIGNOZ_ENDPOINT | cut -d: -f1)
@@ -63,13 +115,21 @@ $config"
 if pgrep -x "mysqld" >/dev/null || pgrep -x "mariadbd" >/dev/null; then
     echo ""
     log_info "MySQL/MariaDB detected."
-    read -p "   Enable MySQL Monitoring? (y/n): " ENABLE_MYSQL
-    if [[ "$ENABLE_MYSQL" =~ ^[Yy]$ ]]; then
-        read -p "   MySQL User: " MYSQL_USER
-        read -s -p "   MySQL Password: " MYSQL_PASS
-        echo ""
-        read -p "   MySQL Host (Default: 127.0.0.1:3306): " MYSQL_HOST
-        MYSQL_HOST=${MYSQL_HOST:-127.0.0.1:3306}
+    if prompt_yes_no "   Enable MySQL Monitoring? (y/n): " "ENABLE_MYSQL"; then
+        if [[ "$INTERACTIVE" == "true" ]]; then
+            read -p "   MySQL User: " MYSQL_USER
+            read -s -p "   MySQL Password: " MYSQL_PASS
+            echo ""
+            read -p "   MySQL Host (Default: 127.0.0.1:3306): " input_host
+            MYSQL_HOST=${input_host:-127.0.0.1:3306}
+        else
+            # Non-interactive: require env vars
+            if [[ -z "$MYSQL_USER" || -z "$MYSQL_PASS" ]]; then
+                log_err "MYSQL_USER and MYSQL_PASS required when ENABLE_MYSQL=y"
+                exit 1
+            fi
+            MYSQL_HOST=${MYSQL_HOST:-127.0.0.1:3306}
+        fi
         
         add_module "mysql" "  mysql:
     endpoint: \"$MYSQL_HOST\"
@@ -84,8 +144,7 @@ fi
 if pgrep "php-fpm" >/dev/null; then
     echo ""
     log_info "PHP-FPM detected."
-    read -p "   Enable PHP-FPM Monitoring? (y/n): " ENABLE_PHP
-    if [[ "$ENABLE_PHP" =~ ^[Yy]$ ]]; then
+    if prompt_yes_no "   Enable PHP-FPM Monitoring? (y/n): " "ENABLE_PHPFPM"; then
         
         # Find PHP-FPM pool config
         PHP_FPM_POOL=""
@@ -107,8 +166,16 @@ if pgrep "php-fpm" >/dev/null; then
                 log_info "Status path already configured: $CURRENT_STATUS"
                 STATUS_PATH="$CURRENT_STATUS"
             else
-                read -p "   Configure pm.status_path = $STATUS_PATH in PHP-FPM? (y/n): " CONFIGURE_STATUS
-                if [[ "$CONFIGURE_STATUS" =~ ^[Yy]$ ]]; then
+                # In non-interactive mode, auto-configure
+                SHOULD_CONFIGURE=false
+                if [[ "$INTERACTIVE" == "true" ]]; then
+                    read -p "   Configure pm.status_path = $STATUS_PATH in PHP-FPM? (y/n): " CONFIGURE_STATUS
+                    [[ "$CONFIGURE_STATUS" =~ ^[Yy]$ ]] && SHOULD_CONFIGURE=true
+                else
+                    SHOULD_CONFIGURE=true  # Auto-configure in non-interactive
+                fi
+                
+                if [[ "$SHOULD_CONFIGURE" == "true" ]]; then
                     # Backup original
                     cp "$PHP_FPM_POOL" "${PHP_FPM_POOL}.bak.$(date +%s)"
                     
@@ -120,9 +187,16 @@ if pgrep "php-fpm" >/dev/null; then
                     
                     log_success "Added pm.status_path to $PHP_FPM_POOL"
                     
-                    # Offer to restart PHP-FPM
-                    read -p "   Restart PHP-FPM to apply changes? (y/n): " RESTART_FPM
-                    if [[ "$RESTART_FPM" =~ ^[Yy]$ ]]; then
+                    # Restart PHP-FPM (auto in non-interactive)
+                    SHOULD_RESTART=false
+                    if [[ "$INTERACTIVE" == "true" ]]; then
+                        read -p "   Restart PHP-FPM to apply changes? (y/n): " RESTART_FPM
+                        [[ "$RESTART_FPM" =~ ^[Yy]$ ]] && SHOULD_RESTART=true
+                    else
+                        SHOULD_RESTART=true
+                    fi
+                    
+                    if [[ "$SHOULD_RESTART" == "true" ]]; then
                         systemctl restart php*-fpm 2>/dev/null || systemctl restart php-fpm 2>/dev/null || log_err "Could not restart PHP-FPM"
                         log_success "PHP-FPM restarted"
                     fi
@@ -157,7 +231,9 @@ if pgrep "php-fpm" >/dev/null; then
         else
             log_info "Could not find PHP-FPM pool config."
             echo "   Make sure pm.status_path is enabled in your www.conf"
-            read -p "   Status URL (Default: http://127.0.0.1/status): " PHP_URL
+            if [[ "$INTERACTIVE" == "true" ]]; then
+                read -p "   Status URL (Default: http://127.0.0.1/status): " PHP_URL
+            fi
             PHP_URL=${PHP_URL:-http://127.0.0.1/status}
         fi
         
@@ -184,9 +260,7 @@ if command -v php &>/dev/null; then
         [[ -z "$OTEL_EXT" ]] && echo "     - opentelemetry"
         [[ -z "$PROTOBUF_EXT" ]] && echo "     - protobuf"
         echo ""
-        read -p "   Install OpenTelemetry PHP extensions via PECL? (y/n): " INSTALL_OTEL_PHP
-        
-        if [[ "$INSTALL_OTEL_PHP" =~ ^[Yy]$ ]]; then
+        if prompt_yes_no "   Install OpenTelemetry PHP extensions via PECL? (y/n): " "ENABLE_PHP_OTEL"; then
             # Check for PECL
             if ! command -v pecl &>/dev/null; then
                 log_err "PECL not found. Install php-pear first:"
